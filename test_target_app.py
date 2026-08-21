@@ -124,7 +124,11 @@ def apply_headers_and_cookies(resp):
     if not VULNS["missing_headers"]:
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["X-Frame-Options"] = "DENY"
-        resp.headers["Content-Security-Policy"] = "default-src 'self'"
+        # style-src 'unsafe-inline' is needed so the toggle panel's own
+        # <style> block still renders when this header is on. The /search
+        # and /greet test endpoints return plain text/JSON, not HTML with
+        # <style>, so this doesn't weaken what a scanner is checking there.
+        resp.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'"
         resp.headers["Strict-Transport-Security"] = "max-age=31536000"
     return resp
 
