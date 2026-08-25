@@ -23,27 +23,65 @@ VULN_KEYS = [
 ]
 
 
-def env_default(name, default="1"):
+def env_default(name, default="0"):
+    # FIX: default changed from "1" to "0". Previously, if the state file
+    # was missing (e.g. ephemeral disk reset on redeploy/restart/new
+    # instance), every vuln silently defaulted back to ON. Now, if state
+    # is ever lost, the app fails SAFE (patched) instead of fails OPEN
+    # (vulnerable). An explicit env var (VULN_SQLI=1, etc.) still overrides.
     return os.environ.get(f"VULN_{name.upper()}", default) == "1"
 
 
 def load_state():
-    """Load saved toggle state if it exists, otherwise fall back to env vars."""
+    """
+    Load toggle state with this precedence:
+      1. Explicit env var (VULN_SQLI=1/0, etc.) always wins if set -- this
+         lets you pin state via Render's dashboard, which is consistent
+         across every instance and survives redeploys with zero disk needed.
+      2. Saved state file, if present and readable.
+      3. env_default fallback (now "0" / patched) if neither is available.
+    """
+    saved = {}
     if os.path.exists(STATE_PATH):
         try:
             with open(STATE_PATH) as f:
                 saved = json.load(f)
-            # Make sure every key is present even if the file is stale/partial
-            return {key: bool(saved.get(key, env_default(key))) for key in VULN_KEYS}
         except (json.JSONDecodeError, OSError):
-            pass
-    return {key: env_default(key) for key in VULN_KEYS}
+            saved = {}
+
+    state = {}
+    for key in VULN_KEYS:
+        env_name = f"VULN_{key.upper()}"
+        if env_name in os.environ:
+            # Explicit env var always takes precedence over the file,
+            # so Render dashboard config can't be silently overridden
+            # by a stale/leftover state file.
+            state[key] = os.environ[env_name] == "1"
+        elif key in saved:
+            state[key] = bool(saved[key])
+        else:
+            state[key] = env_default(key)
+    return state
 
 
 def save_state():
+    """
+    Persist state atomically (write to temp file, then rename) so a crash
+    or concurrent request mid-write can't corrupt the JSON and force a
+    fallback to defaults.
+
+    NOTE: on platforms with ephemeral local disks (e.g. Render without a
+    Persistent Disk, or any multi-instance/autoscaled deployment), this
+    file is NOT a reliable source of truth across restarts or across
+    instances. Prefer setting VULN_<KEY> env vars in the platform's
+    dashboard for anything you need to survive redeploys or be consistent
+    across instances -- this file-based save is best-effort/local only.
+    """
     try:
-        with open(STATE_PATH, "w") as f:
+        tmp_path = f"{STATE_PATH}.tmp"
+        with open(tmp_path, "w") as f:
             json.dump(VULNS, f, indent=2)
+        os.replace(tmp_path, STATE_PATH)
     except OSError as e:
         print(f"Warning: could not persist state to {STATE_PATH}: {e}")
 
@@ -124,10 +162,6 @@ def apply_headers_and_cookies(resp):
     if not VULNS["missing_headers"]:
         resp.headers["X-Content-Type-Options"] = "nosniff"
         resp.headers["X-Frame-Options"] = "DENY"
-        # style-src 'unsafe-inline' is needed so the toggle panel's own
-        # <style> block still renders when this header is on. The /search
-        # and /greet test endpoints return plain text/JSON, not HTML with
-        # <style>, so this doesn't weaken what a scanner is checking there.
         resp.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'"
         resp.headers["Strict-Transport-Security"] = "max-age=31536000"
     return resp
@@ -169,6 +203,16 @@ PANEL_PAGE = """<!doctype html>
     color: var(--muted);
     margin: 0 0 28px;
     font-size: 14px;
+  }}
+  .banner {{
+    background: rgba(124, 140, 255, 0.08);
+    border: 1px solid rgba(124, 140, 255, 0.3);
+    color: var(--text);
+    border-radius: 10px;
+    padding: 12px 16px;
+    font-size: 13px;
+    line-height: 1.5;
+    margin-bottom: 20px;
   }}
   .card {{
     background: var(--panel);
@@ -220,7 +264,6 @@ PANEL_PAGE = """<!doctype html>
   }}
   a.test-link:hover {{ text-decoration: underline; }}
 
-  /* Toggle switch */
   .switch {{
     position: relative;
     display: inline-block;
@@ -228,6 +271,7 @@ PANEL_PAGE = """<!doctype html>
     height: 24px;
   }}
   .switch input {{ opacity: 0; width: 0; height: 0; }}
+  .switch input:disabled + .slider {{ opacity: 0.4; cursor: not-allowed; }}
   .slider {{
     position: absolute;
     cursor: pointer;
@@ -268,6 +312,7 @@ PANEL_PAGE = """<!doctype html>
     transition: filter 0.15s ease;
   }}
   button.save:hover {{ filter: brightness(1.1); }}
+  button.save:disabled {{ opacity: 0.4; cursor: not-allowed; }}
   .state-link {{
     color: var(--muted);
     font-size: 13px;
@@ -294,6 +339,8 @@ PANEL_PAGE = """<!doctype html>
   <h1>Test Target</h1>
   <p class="subtitle">Toggle a vulnerability on to make it exploitable, off to patch it. Saved automatically.</p>
 
+  {env_banner}
+
   <form method="post" action="/_toggle_form">
     <div class="card">
       <table>
@@ -311,9 +358,12 @@ PANEL_PAGE = """<!doctype html>
     </div>
   </form>
   <p class="persist-note">
-    State is persisted to <code>{state_path}</code> and reloaded on startup, so toggles survive
-    app restarts. On Render, a full redeploy resets the disk unless that path lives on a
-    <a class="state-link" style="display:inline" href="https://render.com/docs/disks" target="_blank">Persistent Disk</a>.
+    State is persisted to <code>{state_path}</code> and reloaded on startup. On platforms with
+    ephemeral disks (e.g. Render without a Persistent Disk, or multiple/autoscaled instances),
+    this file is best-effort only -- set <code>VULN_&lt;KEY&gt;</code> environment variables
+    (e.g. <code>VULN_SQLI=0</code>) in your platform's dashboard for state that reliably survives
+    restarts and is consistent across every instance. Env vars always take precedence over the
+    saved file. Missing/unset state now defaults to <b>patched</b>, not vulnerable.
   </p>
 </div>
 </body>
@@ -323,7 +373,7 @@ PANEL_PAGE = """<!doctype html>
 ROW_TEMPLATE = """<tr class="{row_class}">
   <td>
     <label class="switch">
-      <input type="checkbox" name="{key}" {checked}>
+      <input type="checkbox" name="{key}" {checked} {disabled}>
       <span class="slider"></span>
     </label>
   </td>
@@ -335,15 +385,22 @@ ROW_TEMPLATE = """<tr class="{row_class}">
 """
 
 
+def _env_locked_keys():
+    """Keys whose state is pinned by an explicit env var (can't be toggled via UI)."""
+    return {key for key in VULN_KEYS if f"VULN_{key.upper()}" in os.environ}
+
+
 @app.route("/")
 def index():
+    locked = _env_locked_keys()
     rows = ""
     for key, meta in VULN_META.items():
         is_on = VULNS[key]
         rows += ROW_TEMPLATE.format(
             key=key,
             checked="checked" if is_on else "",
-            label=meta["label"],
+            disabled="disabled" if key in locked else "",
+            label=meta["label"] + (" 🔒" if key in locked else ""),
             desc=meta["desc"],
             test=meta["test"],
             test_label=meta["test_label"],
@@ -351,12 +408,24 @@ def index():
             status_class="on" if is_on else "off",
             status_text="Vulnerable" if is_on else "Patched",
         )
-    return PANEL_PAGE.format(rows=rows, state_path=STATE_PATH)
+    env_banner = ""
+    if locked:
+        env_banner = (
+            '<div class="banner">🔒 '
+            + ", ".join(VULN_META[k]["label"] for k in sorted(locked))
+            + " are pinned by environment variables and can't be changed from this UI."
+            " Update the corresponding VULN_&lt;KEY&gt; env var in your platform's"
+            " dashboard to change them.</div>"
+        )
+    return PANEL_PAGE.format(rows=rows, state_path=STATE_PATH, env_banner=env_banner)
 
 
 @app.route("/_toggle_form", methods=["POST"])
 def toggle_form():
+    locked = _env_locked_keys()
     for key in VULNS:
+        if key in locked:
+            continue  # env var wins; don't let a form post silently override it
         VULNS[key] = key in request.form
     save_state()
     return redirect("/")
