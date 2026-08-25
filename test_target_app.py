@@ -133,7 +133,7 @@ VULN_META = {
     },
     "csrf": {
         "label": "CSRF",
-        "desc": "/transfer accepts POSTs with no token check.",
+        "desc": "/transfer and /login accept POSTs with no token check.",
         "test": "/transfer",
         "test_label": "/transfer (POST, no csrf_token)",
     },
@@ -164,6 +164,7 @@ def apply_headers_and_cookies(resp):
         resp.headers["X-Frame-Options"] = "DENY"
         resp.headers["Content-Security-Policy"] = "default-src 'self'; style-src 'self' 'unsafe-inline'"
         resp.headers["Strict-Transport-Security"] = "max-age=31536000"
+        resp.headers["X-XSS-Protection"] = "1; mode=block"
     return resp
 
 
@@ -456,15 +457,30 @@ def greet():
     return f"<h2>Hello, {escape(name)}!</h2>"
 
 
+LOGIN_CSRF_TOKEN = "expected-token-abc123"
+
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "GET":
-        return """
+        # FIX: when the csrf vuln is patched (VULNS["csrf"] is False), embed
+        # a CSRF token in the form so the POST below can validate it. When
+        # csrf is toggled "on" (vulnerable), the field is omitted entirely,
+        # matching /transfer's behavior of having no CSRF protection at all.
+        token_field = ""
+        if not VULNS["csrf"]:
+            token_field = f'<input type="hidden" name="csrf_token" value="{LOGIN_CSRF_TOKEN}">'
+        return f"""
         <form method="post">
+          {token_field}
           <input name="username"><input name="password" type="password">
           <button>Login</button>
         </form>
         """
+    if not VULNS["csrf"]:
+        token = request.form.get("csrf_token")
+        if token != LOGIN_CSRF_TOKEN:
+            return {"error": "invalid csrf token"}, 403
     resp = make_response("logged in")
     if VULNS["insecure_cookies"]:
         resp.set_cookie("session", "fake-session-token", httponly=False, secure=False, samesite=None)
